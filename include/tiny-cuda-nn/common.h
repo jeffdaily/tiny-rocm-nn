@@ -86,6 +86,13 @@
 static_assert(__CUDA_ARCH__ >= TCNN_MIN_GPU_ARCH * 10, "MIN_GPU_ARCH=" STR(TCNN_MIN_GPU_ARCH) "0 must bound __CUDA_ARCH__=" STR(__CUDA_ARCH__) " from below, but doesn't.");
 #endif
 
+// tcnn-API compat: the pinned NVlabs tiny-cuda-nn opened/closed its namespace with these macros
+// (used by instant-ngp-kf's testbed.h); this HIP fork writes `namespace tcnn {` directly.
+#ifndef TCNN_NAMESPACE_BEGIN
+#define TCNN_NAMESPACE_BEGIN namespace tcnn {
+#define TCNN_NAMESPACE_END }
+#endif
+
 namespace tcnn {
 
 #ifdef TCNN_MIN_GPU_ARCH
@@ -130,6 +137,14 @@ using network_precision_t = float;
 //             problems with mixed-precision training.
 // using network_precision_t = float;
 #endif
+
+// tcnn-API compat: the pinned NVlabs tiny-cuda-nn (consumed by instant-ngp-kf) exposes a packed
+// N-element vector `vector_t<T,N>` with operator[]; this HIP fork renamed it `tvec<T,N>` (same
+// memory layout + operator[]). Alias so instant-ngp's headers (common_device.cuh, envmap.cuh,
+// takikawa_encoding.cuh) compile unchanged against the vendored fork. vector_fullp_t is the
+// full-precision (float) variant used by takikawa_encoding.cuh.
+template <typename T, uint32_t N> using vector_t = tvec<T, N>;
+template <uint32_t N> using vector_fullp_t = tvec<float, N>;
 
 enum class Activation {
 	ReLU,

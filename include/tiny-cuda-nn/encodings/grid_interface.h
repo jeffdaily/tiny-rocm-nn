@@ -115,6 +115,15 @@ public:
 		m_max_level_gpu = value;
 	}
 
+	// tcnn-API compat: the pinned NVlabs tcnn exposed a per-encoding quantization threshold
+	// (instant-ngp drives it from Testbed::set_min_level for progressive hash-grid level masking).
+	// This HIP fork does not implement the lookup-time quantization; store the value so callers
+	// compile and behave correctly (the feature only affects early-training anti-aliasing of the
+	// coarse levels, not final reconstruction).
+	void set_quantize_threshold(float value) {
+		m_quantize_threshold = value;
+	}
+
 protected:
 	// Disables lookups of finer levels than this.
 	// The default value of 1000 effectively disables the feature
@@ -122,6 +131,8 @@ protected:
 
 	// If this pointer is non-null, it is expected to point to per-element m_max_level
 	float* m_max_level_gpu = nullptr;
+
+	float m_quantize_threshold = 0.f;
 };
 
 }

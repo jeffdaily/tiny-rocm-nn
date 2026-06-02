@@ -124,9 +124,9 @@ list(APPEND TCNN_DEFINITIONS -DTCNN_MIN_GPU_ARCH=75)
 add_library(tiny-rocm-nn STATIC ${TCNN_SOURCES})
 target_compile_definitions(tiny-rocm-nn PUBLIC ${TCNN_DEFINITIONS})
 target_include_directories(tiny-rocm-nn PUBLIC
-	"include"
-	"dependencies"
-	"dependencies/fmt/include"
+	"${CMAKE_CURRENT_SOURCE_DIR}/include"
+	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies"
+	"${CMAKE_CURRENT_SOURCE_DIR}/dependencies/fmt/include"
 	${ROCM_INCLUDE_DIR}
 	${ROCM_INCLUDE_DIR}/hipblas
 	${ROCM_INCLUDE_DIR}/rocblas
@@ -134,11 +134,20 @@ target_include_directories(tiny-rocm-nn PUBLIC
 )
 target_link_libraries(tiny-rocm-nn PUBLIC hip::device hip::host roc::rocblas roc::hipblas fmt)
 
+# instant-ngp-kf links the target name "tiny-cuda-nn"; alias it to this HIP port so the
+# vendored swap is transparent to the consumer's CMake.
+if (NOT TARGET tiny-cuda-nn)
+	add_library(tiny-cuda-nn ALIAS tiny-rocm-nn)
+endif()
+
 if (TCNN_BUILD_EXAMPLES)
 	add_subdirectory("samples")
 endif()
 
-add_subdirectory("test")
+# test/ + benchmarks are standalone harnesses needing local data; skip when vendored.
+if (TCNN_BUILD_EXAMPLES AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/test/CMakeLists.txt")
+	add_subdirectory("test")
+endif()
 if (TCNN_BUILD_BENCHMARK)
 	add_subdirectory("benchmarks/image")
 endif()

@@ -45,6 +45,24 @@ namespace tcnn {
 // ROCm: AMD GPU wave size (64 threads per wave, vs NVIDIA's 32 threads per warp)
 constexpr uint32_t WAVE_SIZE = 64;
 
+// rocWMMA 7.2.x: __half (== rocwmma::hfloat16_t) matches BOTH the generic
+// amdgcn_mfma<...> specialization (sizeof(ComputeT) < 4) and the dedicated
+// hfloat16_t one, so a fragment<...,__half,...> is an ambiguous instantiation.
+// rocWMMA's canonical 16-bit fragment element is float16_t (== _Float16), which
+// selects a single specialization unambiguously and is bit-identical to __half on
+// gfx9. Map __half -> float16_t for FRAGMENT ELEMENT TYPES only; all host/shared
+// buffers stay __half. Pointers handed to load/store_matrix_sync must match the
+// fragment element type exactly (rocWMMA static_asserts this), so reinterpret via
+// wmma_ptr() at each call site.
+template <typename T> struct wmma_elem { using type = T; };
+template <> struct wmma_elem<__half> { using type = rocwmma::float16_t; };
+template <typename T> using wmma_elem_t = typename wmma_elem<T>::type;
+
+template <typename T> __host__ __device__ __forceinline__
+const wmma_elem_t<T>* wmma_ptr(const T* p) { return reinterpret_cast<const wmma_elem_t<T>*>(p); }
+template <typename T> __host__ __device__ __forceinline__
+wmma_elem_t<T>* wmma_ptr(T* p) { return reinterpret_cast<wmma_elem_t<T>*>(p); }
+
 
 void check_shmem_error(hipError_t error) {
 	if (error != hipSuccess) {
@@ -74,9 +92,9 @@ __device__ void threadblock_layer(Activation activation, __half* __restrict__ ac
 
 	// v19/v34: Use OUT_T for accumulator (same as CUDA)
 	// This allows matching CUDA's behavior exactly
-	using MatrixA = fragment<matrix_a, 16, 16, 16, __half, row_major>;
-	using MatrixB = fragment<matrix_b, 16, 16, 16, __half, weights_layout_t>;
-	using Accumulator = fragment<accumulator, 16, 16, 16, OUT_T>;
+	using MatrixA = fragment<matrix_a, 16, 16, 16, wmma_elem_t<__half>, row_major>;
+	using MatrixB = fragment<matrix_b, 16, 16, 16, wmma_elem_t<__half>, weights_layout_t>;
+	using Accumulator = fragment<accumulator, 16, 16, 16, wmma_elem_t<OUT_T>>;
 
 	MatrixA act_frag;
 	MatrixB weights_frag[N_BLOCKS];
@@ -100,20 +118,20 @@ __device__ void threadblock_layer(Activation activation, __half* __restrict__ ac
 		if (BACKWARD) {
 			// If we're performing the backward pass, additional index swizzling is needed to
 			// load the weights in transposed form.
-			load_matrix_sync(weights_frag[i], weights_this_layer + 16 * i * WIDTH + weights_col, WIDTH);
+			load_matrix_sync(weights_frag[i], wmma_ptr(weights_this_layer + 16 * i * WIDTH + weights_col), WIDTH);
 		} else {
-			load_matrix_sync(weights_frag[i], weights_this_layer + 16 * i + weights_col * WIDTH, WIDTH);
+			load_matrix_sync(weights_frag[i], wmma_ptr(weights_this_layer + 16 * i + weights_col * WIDTH), WIDTH);
 		}
 	}
 
 	TCNN_PRAGMA_UNROLL
 	for (int l = 0; l < N_ITERS; ++l) {
-		fill_fragment(result_frag[l], (__half)0.0f);
+		fill_fragment(result_frag[l], (rocwmma::float16_t)0.0f);
 
 		TCNN_PRAGMA_UNROLL
 		for (uint32_t i = 0; i < N_BLOCKS; ++i) {
 			// Load FP16 from shared memory
-			load_matrix_sync(act_frag, act_shmem + 16 * i + (16 * l) * (WIDTH + SKEW), WIDTH + SKEW);
+			load_matrix_sync(act_frag, wmma_ptr(act_shmem + 16 * i + (16 * l) * (WIDTH + SKEW)), WIDTH + SKEW);
 			// v27: FP16×FP16 → FP32 accumulation
 			mma_sync(result_frag[l], act_frag, weights_frag[i], result_frag[l]);
 		}
@@ -126,7 +144,7 @@ __device__ void threadblock_layer(Activation activation, __half* __restrict__ ac
 			// Instead, defer to shared-memory approach after store_matrix_sync.
 		} else {
 			// Production path: just apply activation
-			warp_activation<OUT_T>(activation, result_frag[l], result_frag[l]);
+			warp_activation<wmma_elem_t<OUT_T>>(activation, result_frag[l], result_frag[l]);
 		}
 	}
 
@@ -136,7 +154,7 @@ __device__ void threadblock_layer(Activation activation, __half* __restrict__ ac
 	// Store MMA results to shared memory
 	TCNN_PRAGMA_UNROLL
 	for (int l = 0; l < N_ITERS; ++l) {
-		store_matrix_sync(act_shmem + weights_col + l * 16 * (WIDTH + SKEW), result_frag[l], WIDTH + SKEW, mem_row_major);
+		store_matrix_sync(wmma_ptr(act_shmem + weights_col + l * 16 * (WIDTH + SKEW)), result_frag[l], WIDTH + SKEW, mem_row_major);
 	}
 
 	// rocWMMA fix: apply activation backward in shared memory where layout is explicit.
@@ -266,25 +284,25 @@ __global__ void kernel_mlp_fused_backward(
 		using namespace rocwmma;
 
 		// Fragments in registers
-		fragment<matrix_a, 16, 16, 16, __half, OUTPUT_LAYOUT> act_frag;
-		fragment<matrix_b, 16, 16, 16, __half, row_major> weights_frag;
+		fragment<matrix_a, 16, 16, 16, wmma_elem_t<__half>, OUTPUT_LAYOUT> act_frag;
+		fragment<matrix_b, 16, 16, 16, wmma_elem_t<__half>, row_major> weights_frag;
 		// v19/v34: Use __half accumulator (same as CUDA)
-		fragment<accumulator, 16, 16, 16, __half> result_frag[N_ITERS];
+		fragment<accumulator, 16, 16, 16, wmma_elem_t<__half>> result_frag[N_ITERS];
 
 		// Load the relevant chunk of the last layer's weight matrix from global memory into registers
 		const uint32_t weights_col = 16 * wi;
 
-		load_matrix_sync(weights_frag, weights + weights_stride * n_hidden_matmuls + weights_col, WIDTH);
+		load_matrix_sync(weights_frag, wmma_ptr(weights + weights_stride * n_hidden_matmuls + weights_col), WIDTH);
 
 		TCNN_PRAGMA_UNROLL
 		for (int l = 0; l < N_ITERS; ++l) {
-			fill_fragment(result_frag[l], (__half)0.0f);
+			fill_fragment(result_frag[l], (rocwmma::float16_t)0.0f);
 
 			// Load a chunk of output gradients from shared memory and multiply with previously loaded weights
 			if (std::is_same<OUTPUT_LAYOUT, row_major>::value) {
-				load_matrix_sync(act_frag, dL_doutput + (elem_idx + 16 * l) * output_stride, output_stride);
+				load_matrix_sync(act_frag, wmma_ptr(dL_doutput + (elem_idx + 16 * l) * output_stride), output_stride);
 			} else {
-				load_matrix_sync(act_frag, dL_doutput + (elem_idx + 16 * l), output_stride);
+				load_matrix_sync(act_frag, wmma_ptr(dL_doutput + (elem_idx + 16 * l)), output_stride);
 			}
 
 			// NOTE: activation transfer of the _output_ activation is expected to be done _prior_ to calling this kernel
@@ -300,7 +318,7 @@ __global__ void kernel_mlp_fused_backward(
 		// Store MMA results to shmem
 		TCNN_PRAGMA_UNROLL
 		for (int l = 0; l < N_ITERS; ++l) {
-			store_matrix_sync(act_shmem + weights_col + (16 * l) * (WIDTH + SKEW), result_frag[l], WIDTH + SKEW, mem_row_major);
+			store_matrix_sync(wmma_ptr(act_shmem + weights_col + (16 * l) * (WIDTH + SKEW)), result_frag[l], WIDTH + SKEW, mem_row_major);
 		}
 
 		__syncthreads();
@@ -446,10 +464,10 @@ __device__ void threadblock_input_layer_forward_dynamic(Activation activation, _
 	using namespace rocwmma;
 
 	// Fragments: small tiles of matrices 
-	fragment<matrix_a, 16, 16, 16, __half, INPUT_LAYOUT> act_frag;
-	fragment<matrix_b, 16, 16, 16, __half, col_major> weights_frag;
+	fragment<matrix_a, 16, 16, 16, wmma_elem_t<__half>, INPUT_LAYOUT> act_frag;
+	fragment<matrix_b, 16, 16, 16, wmma_elem_t<__half>, col_major> weights_frag;
 	// v19/v34: Use OUT_T accumulator (same as CUDA)
-	fragment<accumulator, 16, 16, 16, OUT_T> result_frag[N_ITERS];
+	fragment<accumulator, 16, 16, 16, wmma_elem_t<OUT_T>> result_frag[N_ITERS];
 
 	// Indices
 	const uint32_t li = threadIdx.x; // index in wave ("lane index")
@@ -500,8 +518,8 @@ __device__ void threadblock_input_layer_forward_dynamic(Activation activation, _
 		}
 
 
-		// 1. `fill_fragment(result_frag[l], (__half)0.0f);`
-		fill_fragment(result_frag[l], (__half)0.0f);
+		// 1. `fill_fragment(result_frag[l], (rocwmma::float16_t)0.0f);`
+		fill_fragment(result_frag[l], (rocwmma::float16_t)0.0f);
 		TCNN_PRAGMA_UNROLL
 		// 2. `for (uint32_t i = 0; i < n_tensor_ops; ++i)`
 		for (uint32_t i = 0; i < n_tensor_ops; ++i) {
@@ -510,11 +528,11 @@ __device__ void threadblock_input_layer_forward_dynamic(Activation activation, _
 			// 4. `mma_sync(result_frag[l], act_frag, weights_frag, result_frag[l]);`
 			// Load chunk of inputs and weights from shared memory and multiply them
 			if (std::is_same<INPUT_LAYOUT, row_major>::value) {
-				load_matrix_sync(act_frag, act_shmem + 16 * i, in_width + INPUT_SKEW);
+				load_matrix_sync(act_frag, wmma_ptr(act_shmem + 16 * i), in_width + INPUT_SKEW);
 			} else {
-				load_matrix_sync(act_frag, input_threadblock + 16 * i * batch_size + 16 * l, batch_size);
+				load_matrix_sync(act_frag, wmma_ptr(input_threadblock + 16 * i * batch_size + 16 * l), batch_size);
 			}
-			load_matrix_sync(weights_frag, weights_shmem + 16 * i + weights_col * (in_width + INPUT_SKEW), in_width + INPUT_SKEW);
+			load_matrix_sync(weights_frag, wmma_ptr(weights_shmem + 16 * i + weights_col * (in_width + INPUT_SKEW)), in_width + INPUT_SKEW);
 			mma_sync(result_frag[l], act_frag, weights_frag, result_frag[l]);
 		}
 
@@ -523,7 +541,7 @@ __device__ void threadblock_input_layer_forward_dynamic(Activation activation, _
 		}
 
 		// v19/v34: Activation using OUT_T (same as CUDA)
-		warp_activation<OUT_T>(activation, result_frag[l], result_frag[l]);
+		warp_activation<wmma_elem_t<OUT_T>>(activation, result_frag[l], result_frag[l]);
 	}
 
 	if (std::is_same<INPUT_LAYOUT, col_major>::value) {
@@ -534,7 +552,7 @@ __device__ void threadblock_input_layer_forward_dynamic(Activation activation, _
 	// v19/v34: Store directly (no conversion needed when OUT_T = __half)
 	TCNN_PRAGMA_UNROLL
 	for (int l = 0; l < N_ITERS; ++l) {
-		store_matrix_sync(act_shmem + weights_col + (16 * l) * (WIDTH + SKEW), result_frag[l], WIDTH + SKEW, mem_row_major);
+		store_matrix_sync(wmma_ptr(act_shmem + weights_col + (16 * l) * (WIDTH + SKEW)), result_frag[l], WIDTH + SKEW, mem_row_major);
 	}
 
 
@@ -565,10 +583,10 @@ __device__ void threadblock_last_layer_forward(Activation activation, __half* __
 	using namespace rocwmma;
 
 	// Fragments
-	fragment<matrix_a, 16, 16, 16, __half, row_major> act_frag;
-	fragment<matrix_b, 16, 16, 16, __half, col_major> weights_frag[N_BLOCKS];
+	fragment<matrix_a, 16, 16, 16, wmma_elem_t<__half>, row_major> act_frag;
+	fragment<matrix_b, 16, 16, 16, wmma_elem_t<__half>, col_major> weights_frag[N_BLOCKS];
 	// v19/v34: Use OUT_T accumulator (same as CUDA)
-	fragment<accumulator, 16, 16, 16, OUT_T> result_frag;
+	fragment<accumulator, 16, 16, 16, wmma_elem_t<OUT_T>> result_frag;
 
 	// Indices
 	const uint32_t li = threadIdx.x; // index in wave ("lane index")
@@ -591,26 +609,26 @@ __device__ void threadblock_last_layer_forward(Activation activation, __half* __
 
 	TCNN_PRAGMA_UNROLL
 	for (uint32_t i = 0; i < N_BLOCKS; ++i)
-		load_matrix_sync(weights_frag[i], weights_shmem + 16 * i, WIDTH + SKEW);
+		load_matrix_sync(weights_frag[i], wmma_ptr(weights_shmem + 16 * i), WIDTH + SKEW);
 
 	// Perform last layer by parallelizing over iters
 	for (uint32_t idx = wi; idx < N_ITERS; idx += N_BLOCKS) {
-		fill_fragment(result_frag, (__half)0.0f);
+		fill_fragment(result_frag, (rocwmma::float16_t)0.0f);
 		TCNN_PRAGMA_UNROLL
 		for (uint32_t i = 0; i < N_BLOCKS; ++i) {
 			// Load a chunk of intermediate activations from shared memory and multiply with chunk of the weight matrix
-			load_matrix_sync(act_frag, act_shmem + 16 * i + (16 * idx) * (WIDTH + SKEW), WIDTH + SKEW);
+			load_matrix_sync(act_frag, wmma_ptr(act_shmem + 16 * i + (16 * idx) * (WIDTH + SKEW)), WIDTH + SKEW);
 			mma_sync(result_frag, act_frag, weights_frag[i], result_frag);
 		}
 
 		// v19/v34: Activation using OUT_T (same as CUDA)
-		warp_activation<OUT_T>(activation, result_frag, result_frag);
+		warp_activation<wmma_elem_t<OUT_T>>(activation, result_frag, result_frag);
 
 		// v19/v34: Store directly (no conversion needed when OUT_T = __half)
 		if (output_layout == mem_row_major) {
-			store_matrix_sync(out + idx * 16 * output_stride, result_frag, output_stride, output_layout);
+			store_matrix_sync(wmma_ptr(out + idx * 16 * output_stride), result_frag, output_stride, output_layout);
 		} else {
-			store_matrix_sync(out + idx * 16, result_frag, output_stride, output_layout);
+			store_matrix_sync(wmma_ptr(out + idx * 16), result_frag, output_stride, output_layout);
 		}
 	}
 }

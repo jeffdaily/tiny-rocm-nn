@@ -117,6 +117,9 @@ enum class GradientMode {
 	Overwrite,
 	Accumulate,
 };
+// tcnn-API compat: the pinned NVlabs tiny-cuda-nn named this EGradientMode; instant-ngp-kf's
+// trainable_buffer.cuh / takikawa_encoding.cuh use that spelling. Same enumerators.
+using EGradientMode = GradientMode;
 
 template <typename T, typename PARAMS_T, typename COMPUTE_T=T>
 class DifferentiableObject : public ParametricObject<PARAMS_T> {
