@@ -22,8 +22,11 @@
 
 cmake_minimum_required(VERSION 3.18)
 
-# Set HIP compiler before project()
-set(CMAKE_CXX_COMPILER /opt/rocm/bin/hipcc)
+# Set HIP compiler before project() on Linux; on Windows the caller sets the
+# all-clang toolchain via CMAKE_CXX_COMPILER before invoking add_subdirectory.
+if(NOT WIN32 AND NOT CMAKE_CXX_COMPILER)
+    set(CMAKE_CXX_COMPILER /opt/rocm/bin/hipcc)
+endif()
 
 project(
 	tiny-rocm-nn
@@ -63,14 +66,23 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Setup ROCm dependencies
 ###############################################################################
 
-# Find ROCm packages
-set(ROCM_ROOT_DIR "/opt/rocm/")
-set(ROCM_INCLUDE_DIR "/opt/rocm/include/")
-
+# Find ROCm packages; on Windows the HIP SDK lives in the TheRock devel tree
+# found via CMAKE_PREFIX_PATH -- HIP_INCLUDE_DIRS is set by find_package(hip).
 find_package(hip REQUIRED)
 find_package(hiprtc REQUIRED)
 find_package(rocblas REQUIRED)
 find_package(hipblas REQUIRED)
+
+if(WIN32)
+    # On Windows, use HIP_INCLUDE_DIRS (set by find_package(hip)) instead of
+    # the hardcoded Linux path.
+    list(GET HIP_INCLUDE_DIRS 0 ROCM_INCLUDE_DIR)
+    set(ROCM_INCLUDE_DIR "${ROCM_INCLUDE_DIR}/")
+    get_filename_component(ROCM_ROOT_DIR "${ROCM_INCLUDE_DIR}/.." ABSOLUTE)
+else()
+    set(ROCM_ROOT_DIR "/opt/rocm/")
+    set(ROCM_INCLUDE_DIR "/opt/rocm/include/")
+endif()
 
 # Include directories - add all ROCm include paths
 include_directories(${ROCM_INCLUDE_DIR})
@@ -133,6 +145,21 @@ target_include_directories(tiny-rocm-nn PUBLIC
 	${ROCM_INCLUDE_DIR}/rocwmma
 )
 target_link_libraries(tiny-rocm-nn PUBLIC hip::device hip::host roc::rocblas roc::hipblas fmt)
+
+# Propagate HIP architecture to this target so rocWMMA selects the correct
+# backend (MFMA on gfx9, WMMA on RDNA). CMAKE_HIP_ARCHITECTURES is set by the
+# top-level DDN-SLAM build or instant-ngp-kf CMakeLists before this subdir runs.
+# Note: HIP_ARCHITECTURES target property only applies to .cu files; the .cpp
+# sources compiled with -x hip need an explicit --offload-arch flag instead.
+if(DEFINED CMAKE_HIP_ARCHITECTURES AND NOT CMAKE_HIP_ARCHITECTURES STREQUAL "")
+    set_target_properties(tiny-rocm-nn PROPERTIES HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
+    # Build the arch list as --offload-arch=<arch> flags (one list element per arch)
+    set(_TCNN_OFFLOAD_ARCH_FLAGS)
+    foreach(_arch ${CMAKE_HIP_ARCHITECTURES})
+        list(APPEND _TCNN_OFFLOAD_ARCH_FLAGS "--offload-arch=${_arch}")
+    endforeach()
+    target_compile_options(tiny-rocm-nn PRIVATE ${_TCNN_OFFLOAD_ARCH_FLAGS})
+endif()
 
 # instant-ngp-kf links the target name "tiny-cuda-nn"; alias it to this HIP port so the
 # vendored swap is transparent to the consumer's CMake.

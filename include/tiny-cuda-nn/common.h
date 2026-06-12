@@ -78,6 +78,19 @@
 #define TCNN_HOST
 #endif
 
+// On Windows, <cmath> exports fma(float), fma(double), fma(long double) all
+// of equal rank; calling fma(__half,...) is ambiguous. Provide an explicit
+// host overload that widens to float so vec.h's CWISE_OP(fma,...) compiles.
+// On Linux/ROCm the single float overload resolves via implicit conversion
+// (no ambiguity) so this guard is harmless there.
+#if defined(_WIN32) && defined(__HIPCC__) && !defined(__HIP_DEVICE_COMPILE__)
+#include <cmath>
+#include <hip/hip_fp16.h>
+inline __host__ __half fma(__half a, __half b, __half c) {
+    return __half(std::fmaf(float(a), float(b), float(c)));
+}
+#endif
+
 #include <tiny-cuda-nn/vec.h>
 
 // For ROCm/HIP, we don't check GPU architecture at compile time
