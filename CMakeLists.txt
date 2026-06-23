@@ -152,6 +152,9 @@ target_link_libraries(tiny-rocm-nn PUBLIC hip::device hip::host roc::rocblas roc
 # Note: HIP_ARCHITECTURES target property only applies to .cu files; the .cpp
 # sources compiled with -x hip need an explicit --offload-arch flag instead.
 if(DEFINED CMAKE_HIP_ARCHITECTURES AND NOT CMAKE_HIP_ARCHITECTURES STREQUAL "")
+    # Auto-detection lists an arch once per GPU agent; collapse to unique values
+    # before emitting one --offload-arch flag per arch.
+    list(REMOVE_DUPLICATES CMAKE_HIP_ARCHITECTURES)
     set_target_properties(tiny-rocm-nn PROPERTIES HIP_ARCHITECTURES "${CMAKE_HIP_ARCHITECTURES}")
     # Build the arch list as --offload-arch=<arch> flags (one list element per arch)
     set(_TCNN_OFFLOAD_ARCH_FLAGS)
